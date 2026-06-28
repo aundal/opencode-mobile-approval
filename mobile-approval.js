@@ -24,6 +24,10 @@ const NOTIFY_DONE_WHEN_INACTIVE_ONLY = true; // "Opgave udført" sendes kun når
 const IDLE_DEBOUNCE_MS = 1500;               // Slår dublerede session.idle-hændelser sammen.
 const SUPPRESS_ON_ABORT = true;              // Undlad notificationer, hvis du selv aborter prompten (esc).
 
+// --- Rydning af notifikationer ---
+const CLEAR_NOTIFICATIONS_ON_ACTIVITY = true; // Ryd sendte telefon-notifikationer når du er aktiv i OpenCode igen.
+const CLEAR_ON_ACTIVITY_DEBOUNCE_MS = 1000;   // Mindste tid (ms) mellem clear-bølger ved aktivitet.
+
 // --- Begivenheder ---
 // - "permission.asked" (Telefon-godkendelse efter timer)
 // - "session.idle" (OpenCode er FÆRDIG med sit arbejde og klar til input)
@@ -54,6 +58,43 @@ function logToFile(msg) {
   } catch (e) {
     // Ignorer lydløst
   }
+}
+
+function encodeHeaderValue(value) {
+  return /[^\x20-\x7E]/.test(value)
+    ? `=?UTF-8?B?${Buffer.from(value, "utf8").toString("base64")}?=`
+    : value;
+}
+
+// Logger HTTP-status + alle response-headers fra et ntfy-svar (til fejlsøgning).
+// Ved ikke-OK svar logges også selve fejl-body'en.
+async function logNtfyResponse(label, res) {
+  try {
+    const headerObj = {};
+    if (res && res.headers && typeof res.headers.forEach === "function") {
+      res.headers.forEach((v, k) => { headerObj[k] = v; });
+    }
+    const status = res ? `${res.status} ${res.statusText || ""}`.trim() : "intet svar";
+    logToFile(`[${label}] HTTP ${status} | headers: ${JSON.stringify(headerObj)}`);
+    if (res && res.ok === false) {
+      let bodyText = "";
+      try { bodyText = await res.text(); } catch (e) {}
+      logToFile(`[${label}] Ikke-OK body: ${String(bodyText).slice(0, 800)}`);
+    }
+  } catch (e) {
+    logToFile(`[${label}] Kunne ikke logge response: ${e.message}`);
+  }
+}
+
+// ntfy sequence IDs må kun indeholde [-_A-Za-z0-9] og højst være 64 tegn.
+// Ellers afviser ntfy HELE beskeden med HTTP 400 ("sequence ID invalid").
+function ntfySeqId(raw) {
+  const cleaned = String(raw).replace(/[^-_A-Za-z0-9]/g, "_");
+  if (cleaned.length <= 64) return cleaned;
+  // For lang -> deterministisk forkortelse (stabil, så clear stadig matcher).
+  let h = 0;
+  for (let i = 0; i < cleaned.length; i++) h = (Math.imul(h, 31) + cleaned.charCodeAt(i)) >>> 0;
+  return (cleaned.slice(0, 55) + "_" + h.toString(36)).slice(0, 64);
 }
 
 export const MobileApprovalPlugin = async ({ client }) => {
@@ -103,6 +144,46 @@ export const MobileApprovalPlugin = async ({ client }) => {
       logToFile(`OS-idle kunne ikke måles (${e.message}). Falder tilbage til OpenCode-interaktion.`);
     }
     return Math.floor((Date.now() - lastInteractionTs) / 1000);
+  }
+
+  // --- Rydning af allerede sendte telefon-notifikationer ---------------------
+  // Holder styr på notifikationer vi har sendt, så de kan clears igen via ntfy.
+  // sequence_id -> { kind: "permission"|"done"|"error"|"status", sessionID }
+  const activeNotifications = new Map();
+  let lastClearOnActivityTs = 0;
+
+  // Beder ntfy om at fjerne (dismiss/mark-as-read) en allerede sendt notifikation.
+  // Prøver op til 3 gange før den giver op (så den kan forsøges igen senere).
+  async function clearNotification(sequenceID) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const res = await fetch(`https://ntfy.sh/${NTFY_ANMODNING}/${encodeURIComponent(sequenceID)}/clear`, {
+          method: "PUT",
+        });
+        await logNtfyResponse(`clear ${sequenceID}`, res);
+        if (!res || res.ok === undefined || res.ok) {
+          activeNotifications.delete(sequenceID);
+          logToFile(`Notifikation cleared: ${sequenceID} (forsøg ${attempt}/3).`);
+          return true;
+        }
+        logToFile(`Clear gav ikke-OK svar for ${sequenceID} (forsøg ${attempt}/3).`);
+      } catch (err) {
+        logToFile(`Clear fejlede for ${sequenceID} (forsøg ${attempt}/3): ${err.message}`);
+      }
+      if (attempt < 3) await new Promise((r) => setTimeout(r, attempt * 250));
+    }
+    logToFile(`Gav op med at clear ${sequenceID} efter 3 forsøg. Beholdes til næste forsøg.`);
+    return false;
+  }
+
+  // Clearer alle aktive notifikationer (fx når brugeren er aktiv i OpenCode igen).
+  async function clearAllNotifications(reason) {
+    const ids = [...activeNotifications.keys()];
+    if (ids.length === 0) return;
+    logToFile(`Clearer ${ids.length} notifikation(er). Årsag: ${reason}.`);
+    for (const seq of ids) {
+      await clearNotification(seq);
+    }
   }
 
   // NFTY-listener
@@ -164,16 +245,20 @@ export const MobileApprovalPlugin = async ({ client }) => {
                     statusBody += `\n✅ Ingen afventende tilladelser i øjeblikket.`;
                   }
 
-                  await fetch(`https://ntfy.sh/${NTFY_ANMODNING}`, {
+                  const statusSeq = ntfySeqId("status-global");
+                  const statusRes = await fetch(`https://ntfy.sh/${NTFY_ANMODNING}`, {
                     method: 'POST',
                     headers: {
-                      'Title': 'Systemstatus: OpenCode',
+                      'Title': encodeHeaderValue('Systemstatus: OpenCode'),
                       'Priority': 'default',
                       'Tags': 'chart_with_upwards_trend,computer',
-                      'X-Icon': NTFY_ICON_URL
+                      'X-Icon': NTFY_ICON_URL,
+                      'X-Sequence-ID': statusSeq
                     },
                     body: statusBody
                   });
+                  await logNtfyResponse("status", statusRes);
+                  activeNotifications.set(statusSeq, { kind: "status" });
 
                   logToFile("Statusopdatering sendt succesfuldt til telefonen.");
                   continue; 
@@ -234,6 +319,16 @@ export const MobileApprovalPlugin = async ({ client }) => {
         (event.type === "message.updated" && props.info && props.info.role === "user")
       ) {
         lastInteractionTs = Date.now();
+
+        // Brugeren er aktiv i OpenCode igen -> ryd alle sendte telefon-notifikationer.
+        // Throttles, så hurtig tastning ikke spammer ntfy med clear-kald.
+        if (CLEAR_NOTIFICATIONS_ON_ACTIVITY) {
+          const nowTs = Date.now();
+          if (nowTs - lastClearOnActivityTs >= CLEAR_ON_ACTIVITY_DEBOUNCE_MS) {
+            lastClearOnActivityTs = nowTs;
+            clearAllNotifications(`aktivitet (${event.type})`).catch(() => {});
+          }
+        }
       }
 
       // Brugeren svarer i terminalen:
@@ -246,6 +341,13 @@ export const MobileApprovalPlugin = async ({ client }) => {
             clearTimeout(reminder.timer);
             activeReminders.delete(id);
             logToFile(`Brugeren svarede lokalt. Annullerede timeren for ID: ${id}. Ingen besked sendt til telefon.`);
+          }
+          // Hvis permission-notifikationen allerede ER sendt, så clear den nu.
+          if (sessionID) {
+            const seq = ntfySeqId(`perm-${id}`);
+            if (activeNotifications.has(seq)) {
+              clearNotification(seq).catch(() => {});
+            }
           }
         }
         return; 
@@ -293,27 +395,29 @@ export const MobileApprovalPlugin = async ({ client }) => {
           }
 
           const permissionType = props.permission || "";
-          let handling = "Handling på";
+          let permissionLabel = "Andet";
           if (permissionType === "external_directory" || permissionType === "directory") {
-            handling = "Adgang til";
+            permissionLabel = "Adgang";
           } else if (permissionType === "read_file") {
-            handling = "Læsning af";
+            permissionLabel = "Læsning";
           } else if (permissionType === "write_file" || permissionType === "edit") {
-            handling = "Redigering af";
+            permissionLabel = "Redigering";
           } else if (permissionType === "bash") {
-            handling = "Kørsel af kommando i";
+            permissionLabel = "Kommando";
           }
 
-          const commandText = `${handling} ${pathText}\nAf ${sessionTitle}`;
+          const commandText = `Til: ${pathText}\nAf: ${sessionTitle}`;
 
+          const permSeq = ntfySeqId(`perm-${id}`);
           try {
-            await fetch(`https://ntfy.sh/${NTFY_ANMODNING}`, {
+            const permRes = await fetch(`https://ntfy.sh/${NTFY_ANMODNING}`, {
               method: 'POST',
               headers: {
-                'Title': 'OpenCode kræver godkendelse!',
+                'Title': encodeHeaderValue(`OpenCode: ${permissionLabel}`),
                 'Priority': 'high',
                 'Tags': 'warning,robot_face',
                 'X-Icon': NTFY_ICON_URL,
+                'X-Sequence-ID': permSeq,
                 'X-Actions': [
                   `http, Tillad, https://ntfy.sh/${NTFY_SVAR}, method=POST, body=once:${sessionID}:${id}, clear=true`,
                   `http, Afvis, https://ntfy.sh/${NTFY_SVAR}, method=POST, body=reject:${sessionID}:${id}, clear=true`
@@ -321,6 +425,8 @@ export const MobileApprovalPlugin = async ({ client }) => {
               },
               body: commandText
             });
+            await logNtfyResponse("permission", permRes);
+            activeNotifications.set(permSeq, { kind: "permission", sessionID });
           } catch (err) {
             logToFile(`Kunne ikke sende push-notifikation: ${err.message}`);
           }
@@ -375,17 +481,21 @@ export const MobileApprovalPlugin = async ({ client }) => {
           } catch (e) {}
         }
 
+        const doneSeq = ntfySeqId(`done-${sessionID || "global"}`);
         try {
-          await fetch(`https://ntfy.sh/${NTFY_ANMODNING}`, {
+          const doneRes = await fetch(`https://ntfy.sh/${NTFY_ANMODNING}`, {
             method: 'POST',
             headers: {
-              'Title': 'Opgave udført!',
+              'Title': encodeHeaderValue('Opgave udført!'),
               'Priority': 'default',
               'Tags': 'heavy_check_mark,robot_face',
-              'X-Icon': NTFY_ICON_URL
+              'X-Icon': NTFY_ICON_URL,
+              'X-Sequence-ID': doneSeq
             },
             body: `OpenCode har udført opgaven og afventer dit input.\nAf ${sessionTitle}`
           });
+          await logNtfyResponse("done", doneRes);
+          activeNotifications.set(doneSeq, { kind: "done", sessionID });
         } catch (err) {
           logToFile(`Kunne ikke sende færdig-notifikation: ${err.message}`);
         }
@@ -407,6 +517,12 @@ export const MobileApprovalPlugin = async ({ client }) => {
                 clearTimeout(r.timer);
                 activeReminders.delete(pid);
                 logToFile(`Ryddede ventende permission-timer ${pid} pga. annullering.`);
+              }
+            }
+            // Clear også evt. allerede SENDTE permission-notifikationer for sessionen.
+            for (const [seq, info] of [...activeNotifications]) {
+              if (info.kind === "permission" && info.sessionID === sessionID) {
+                clearNotification(seq).catch(() => {});
               }
             }
           }
@@ -431,17 +547,21 @@ export const MobileApprovalPlugin = async ({ client }) => {
           } catch (e) {}
         }
 
+        const errorSeq = ntfySeqId(`error-${sessionID || "global"}`);
         try {
-          await fetch(`https://ntfy.sh/${NTFY_ANMODNING}`, {
+          const errorRes = await fetch(`https://ntfy.sh/${NTFY_ANMODNING}`, {
             method: 'POST',
             headers: {
-              'Title': 'Der opstod en fejl!',
+              'Title': encodeHeaderValue('Der opstod en fejl!'),
               'Priority': 'high',
               'Tags': 'x,warning',
-              'X-Icon': NTFY_ICON_URL
+              'X-Icon': NTFY_ICON_URL,
+              'X-Sequence-ID': errorSeq
             },
             body: `OpenCode stødte på en fejl under kørslen.\nAf: ${sessionTitle}`
           });
+          await logNtfyResponse("error", errorRes);
+          activeNotifications.set(errorSeq, { kind: "error", sessionID });
         } catch (err) {
           logToFile(`Kunne ikke sende fejl-notifikation: ${err.message}`);
         }

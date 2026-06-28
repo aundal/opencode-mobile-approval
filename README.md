@@ -16,6 +16,11 @@ OpenCode spørger om lov, før den fx læser filer uden for projektet, redigerer
 
 Det bruger ntfy.sh som transport (gratis, ingen konto nødvendig) og OpenCode's egen SDK-klient til at aflevere svaret tilbage i kørslen.
 
+Permission-notifikationer bruger formatet:
+
+- Titel: `OpenCode: Adgang`, `OpenCode: Læsning`, `OpenCode: Redigering`, `OpenCode: Kommando` eller `OpenCode: Andet`
+- Body: `Til: <sti eller mønster>` efterfulgt af `Af: <session titel>`
+
 ---
 
 ## Sådan virker det
@@ -28,7 +33,7 @@ Det bruger ntfy.sh som transport (gratis, ingen konto nødvendig) og OpenCode's 
    - **Afvis** → sender `reject:<sessionID>:<permissionID>`
 5. En baggrundslytter abonnerer på svar-kanalen. Når svaret kommer, afleveres det direkte tilbage til OpenCode via SDK-klienten, og kørslen fortsætter.
 
-Beskeden på telefonen viser handlingstype (adgang/læsning/redigering/kommando), stien/mønsteret og projektets (sessionens) titel.
+Beskeden på telefonen viser stien/mønsteret og projektets (sessionens) titel. Allerede sendte notifikationer kan også clears automatisk igen, når du er aktiv tilbage i OpenCode.
 
 ---
 
@@ -81,6 +86,8 @@ Alle indstillinger ligger i KONFIGURATION-blokken øverst i `mobile-approval.js`
 | `LOG_FILE` | `os.tmpdir()/opencode-mobile-approval.log` | Sti til debug-loggen. |
 | `NTFY_ICON_URL` | OpenCode-logo | Ikon der vises i notifikationen. |
 | `DEBUG` | `true` | `true` skriver log til `LOG_FILE`; `false` slår logning fra. |
+| `CLEAR_NOTIFICATIONS_ON_ACTIVITY` | `true` | Ryd sendte telefon-notifikationer når du er aktiv i OpenCode igen. |
+| `CLEAR_ON_ACTIVITY_DEBOUNCE_MS` | `1000` | Mindste tid i ms mellem clear-bølger ved aktivitet. |
 
 ---
 
@@ -100,15 +107,17 @@ Notifikationerne kan også afsløre filstier og projektnavne — hav det med i o
 
 ## Permission-typer i beskeden
 
-Pluginet oversætter OpenCode's permission-type til en kort dansk handling:
+Pluginet oversætter OpenCode's permission-type til en kort dansk label i titlen:
 
 | Type | Tekst |
 |---|---|
-| `external_directory` / `directory` | Adgang til |
-| `read_file` | Læsning af |
-| `write_file` / `edit` | Redigering af |
-| `bash` | Kørsel af kommando i |
-| (andet) | Handling på |
+| `external_directory` / `directory` | Adgang |
+| `read_file` | Læsning |
+| `write_file` / `edit` | Redigering |
+| `bash` | Kommando |
+| (andet) | Andet |
+
+Titler med danske tegn RFC 2047-encodes automatisk, så fx `Læsning` og `Redigering` vises korrekt i ntfy-klienter der ellers erstatter UTF-8-tegn i headers.
 
 ---
 
