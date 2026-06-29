@@ -21,6 +21,11 @@ Permission-notifikationer bruger formatet:
 - Titel: `OpenCode: Adgang`, `OpenCode: Læsning`, `OpenCode: Redigering`, `OpenCode: Kommando` eller `OpenCode: Andet`
 - Body: `Til: <sti eller mønster>` efterfulgt af `Af: <session titel>`
 
+Færdig-notifikationer bruger formatet:
+
+- Titel: `Opgave udført!`
+- Body: `Af: <session titel>`
+
 ---
 
 ## Sådan virker det
@@ -32,6 +37,7 @@ Permission-notifikationer bruger formatet:
    - **Tillad** → sender `once:<sessionID>:<permissionID>`
    - **Afvis** → sender `reject:<sessionID>:<permissionID>`
 5. En baggrundslytter abonnerer på svar-kanalen. Når svaret kommer, afleveres det direkte tilbage til OpenCode via SDK-klienten, og kørslen fortsætter.
+6. Når OpenCode bliver færdig (`session.idle`), sendes en færdig-notifikation. Hvis `session.idle` kommer før du har været inaktiv længe nok, planlægger pluginet notifikationen og sender den automatisk når idle-threshold nås, medmindre du bliver aktiv igen eller der opstår fejl/abort.
 
 Beskeden på telefonen viser stien/mønsteret og projektets (sessionens) titel. Allerede sendte notifikationer kan også clears automatisk igen, når du er aktiv tilbage i OpenCode.
 

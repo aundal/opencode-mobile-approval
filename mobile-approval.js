@@ -116,6 +116,9 @@ export const MobileApprovalPlugin = async ({ client }) => {
   // sessionID -> sidst behandlede session.idle (til debounce af dubletter)
   const lastIdleHandledTs = new Map();
 
+  // sessionID -> timer for udsat "done", hvis session.idle kom før idle-threshold var nået
+  const pendingDoneTimers = new Map();
+
   // Returnerer sekunder siden sidste brugerinput.
   // OS-niveau på Windows (GetLastInputInfo) og macOS (IOHIDSystem).
   // Fejl/andre platforme: fallback til sidste OpenCode-interaktion.
@@ -183,6 +186,42 @@ export const MobileApprovalPlugin = async ({ client }) => {
     logToFile(`Clearer ${ids.length} notifikation(er). Årsag: ${reason}.`);
     for (const seq of ids) {
       await clearNotification(seq);
+    }
+  }
+
+  async function sendDoneNotification(sessionID) {
+    let sessionTitle = "OpenCode";
+    if (sessionID) {
+      try {
+        const sessionRes = await client.session.get({
+          path: { id: sessionID }
+        });
+        const session = sessionRes.data ?? sessionRes;
+        if (session && session.title) {
+          sessionTitle = session.title;
+        }
+      } catch (e) {}
+    }
+
+    const doneSeq = ntfySeqId(`done-${sessionID || "global"}`);
+    const doneBody = `Af: ${sessionTitle}`;
+    logToFile(`done payload. Session=${sessionID || "(mangler)"} seq=${doneSeq} title=${encodeHeaderValue('Opgave udført!')} body=${JSON.stringify(doneBody)}`);
+    try {
+      const doneRes = await fetch(`https://ntfy.sh/${NTFY_ANMODNING}`, {
+        method: 'POST',
+        headers: {
+          'Title': encodeHeaderValue('Opgave udført!'),
+          'Priority': 'high',
+          'Tags': 'heavy_check_mark,robot_face',
+          'X-Icon': NTFY_ICON_URL,
+          'X-Sequence-ID': doneSeq
+        },
+        body: doneBody
+      });
+      await logNtfyResponse("done", doneRes);
+      activeNotifications.set(doneSeq, { kind: "done", sessionID });
+    } catch (err) {
+      logToFile(`Kunne ikke sende færdig-notifikation: ${err.message}`);
     }
   }
 
@@ -320,6 +359,13 @@ export const MobileApprovalPlugin = async ({ client }) => {
       ) {
         lastInteractionTs = Date.now();
 
+        // Brugeren blev aktiv før en udsat done blev sendt -> annuller den.
+        for (const [doneSessionID, timer] of pendingDoneTimers) {
+          clearTimeout(timer);
+          pendingDoneTimers.delete(doneSessionID);
+          logToFile(`Annullerede udsat færdig-notifikation pga. aktivitet. Session=${doneSessionID}`);
+        }
+
         // Brugeren er aktiv i OpenCode igen -> ryd alle sendte telefon-notifikationer.
         // Throttles, så hurtig tastning ikke spammer ntfy med clear-kald.
         if (CLEAR_NOTIFICATIONS_ON_ACTIVITY) {
@@ -439,6 +485,7 @@ export const MobileApprovalPlugin = async ({ client }) => {
       // 2. OpenCode er færdig med sit arbejde (session.idle)
       else if (event.type === 'session.idle') {
         const now = Date.now();
+        logToFile(`session.idle modtaget. Session=${sessionID || "(mangler)"} now=${now}`);
 
         // Debounce: session.idle fyrer ofte flere gange på få ms.
         const lastHandled = sessionID ? (lastIdleHandledTs.get(sessionID) || 0) : 0;
@@ -459,46 +506,33 @@ export const MobileApprovalPlugin = async ({ client }) => {
         // Send kun "udført", når brugeren ikke er aktiv ved maskinen.
         if (NOTIFY_DONE_WHEN_INACTIVE_ONLY) {
           const idle = await getIdleSeconds();
+          logToFile(`session.idle vurdering. Session=${sessionID || "(mangler)"} idle=${idle}s threshold=${ACTIVE_THRESHOLD_SECONDS}s notifyWhenInactiveOnly=${NOTIFY_DONE_WHEN_INACTIVE_ONLY}`);
           if (idle < ACTIVE_THRESHOLD_SECONDS) {
-            logToFile(`Bruger er aktiv (${idle}s < ${ACTIVE_THRESHOLD_SECONDS}s). Sender IKKE færdig-notifikation.`);
+            const delayMs = (ACTIVE_THRESHOLD_SECONDS - idle) * 1000;
+            if (sessionID) {
+              const existing = pendingDoneTimers.get(sessionID);
+              if (existing) clearTimeout(existing);
+              const timer = setTimeout(async () => {
+                pendingDoneTimers.delete(sessionID);
+                const retriedIdle = await getIdleSeconds();
+                logToFile(`session.idle forsinket revurdering. Session=${sessionID} idle=${retriedIdle}s threshold=${ACTIVE_THRESHOLD_SECONDS}s`);
+                if (retriedIdle < ACTIVE_THRESHOLD_SECONDS) {
+                  logToFile(`Bruger er stadig aktiv ved udsat færdig-notifikation (${retriedIdle}s < ${ACTIVE_THRESHOLD_SECONDS}s). Sender IKKE færdig-notifikation.`);
+                  return;
+                }
+                logToFile(`Bruger er nu inaktiv ved udsat færdig-notifikation (${retriedIdle}s ≥ ${ACTIVE_THRESHOLD_SECONDS}s). Sender færdig-notifikation.`);
+                await sendDoneNotification(sessionID);
+              }, delayMs);
+              pendingDoneTimers.set(sessionID, timer);
+            }
+            logToFile(`Bruger er aktiv (${idle}s < ${ACTIVE_THRESHOLD_SECONDS}s). Planlægger færdig-notifikation om ${Math.ceil(delayMs / 1000)}s.`);
             return;
           }
           logToFile(`Bruger inaktiv (${idle}s ≥ ${ACTIVE_THRESHOLD_SECONDS}s). Sender færdig-notifikation.`);
         } else {
           logToFile(`OpenCode er færdig (session.idle). Sender færdig-notifikation.`);
         }
-
-        let sessionTitle = "OpenCode";
-        if (sessionID) {
-          try {
-            const sessionRes = await client.session.get({
-              path: { id: sessionID }
-            });
-            const session = sessionRes.data ?? sessionRes;
-            if (session && session.title) {
-              sessionTitle = session.title;
-            }
-          } catch (e) {}
-        }
-
-        const doneSeq = ntfySeqId(`done-${sessionID || "global"}`);
-        try {
-          const doneRes = await fetch(`https://ntfy.sh/${NTFY_ANMODNING}`, {
-            method: 'POST',
-            headers: {
-              'Title': encodeHeaderValue('Opgave udført!'),
-              'Priority': 'default',
-              'Tags': 'heavy_check_mark,robot_face',
-              'X-Icon': NTFY_ICON_URL,
-              'X-Sequence-ID': doneSeq
-            },
-            body: `OpenCode har udført opgaven og afventer dit input.\nAf ${sessionTitle}`
-          });
-          await logNtfyResponse("done", doneRes);
-          activeNotifications.set(doneSeq, { kind: "done", sessionID });
-        } catch (err) {
-          logToFile(`Kunne ikke sende færdig-notifikation: ${err.message}`);
-        }
+        await sendDoneNotification(sessionID);
       }
 
       // 3. Der skete en fejl under kørslen (session.error)
@@ -511,6 +545,12 @@ export const MobileApprovalPlugin = async ({ client }) => {
           suppressDoneGlobalUntil = Date.now() + 2000; // undertryk den efterfølgende session.idle
           if (sessionID) {
             suppressDoneUntil.set(sessionID, Date.now() + 2000);
+            const pendingDone = pendingDoneTimers.get(sessionID);
+            if (pendingDone) {
+              clearTimeout(pendingDone);
+              pendingDoneTimers.delete(sessionID);
+              logToFile(`Annullerede udsat færdig-notifikation pga. annullering. Session=${sessionID}`);
+            }
             // Ryd evt. ventende permission-timers for samme session.
             for (const [pid, r] of activeReminders) {
               if (r.sessionID === sessionID) {
@@ -531,7 +571,15 @@ export const MobileApprovalPlugin = async ({ client }) => {
 
         // Ægte fejl: undertryk den "udført", der ellers fyrer lige efter.
         suppressDoneGlobalUntil = Date.now() + 2000;
-        if (sessionID) suppressDoneUntil.set(sessionID, Date.now() + 2000);
+        if (sessionID) {
+          suppressDoneUntil.set(sessionID, Date.now() + 2000);
+          const pendingDone = pendingDoneTimers.get(sessionID);
+          if (pendingDone) {
+            clearTimeout(pendingDone);
+            pendingDoneTimers.delete(sessionID);
+            logToFile(`Annullerede udsat færdig-notifikation pga. fejl. Session=${sessionID}`);
+          }
+        }
         logToFile(`Der opstod en fejl i sessionen (session.error). Sender fejl-notifikation.`);
 
         let sessionTitle = "OpenCode";
